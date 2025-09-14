@@ -44,23 +44,25 @@ class PlanningAgent(Runnable):
     def __init__(self):
         self.llm = get_llm()
         self.prompt = PromptTemplate(
-            input_variables=["user_query", "query_understanding"],
+            input_variables=["context_object"],
             template=SYSTEM_PROMPT + """
 
-Original User Query: {user_query}
-Query Understanding Results: {query_understanding}
+FULL CONTEXT OBJECT INPUT:
+{context_object}
 
-Based on the query understanding results, create an appropriate response:
+Based on the query understanding results within the context object, create an appropriate response:
 
 If is_ambiguous is true:
 - Set action to "CLARIFY"  
-- Use the clarification_question as message_to_user
+- Use the EXACT clarification_question from query understanding as message_to_user
 - Set plan to null
 
 If is_ambiguous is false:
 - Set action to "PROCEED_TO_EXECUTE"
 - Create a detailed execution plan with selected tools
 - Set message_to_user to null
+
+IMPORTANT: If the query is ambiguous, you MUST use the exact "clarification_question" text from the query understanding results. Do not generate your own clarification message.
 
 Response format:
 {{
@@ -91,10 +93,9 @@ Response format:
                 context.error_message = "Planning Agent: No query understanding results available"
                 return context
             
-            # Invoke the chain
+            # Invoke the chain with full context object
             result = self.chain.invoke({
-                "user_query": context.user_query,
-                "query_understanding": json.dumps(context.query_understanding)
+                "context_object": json.dumps(context.model_dump(), indent=2, default=str)
             })
             
             # Update context with results

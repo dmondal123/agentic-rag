@@ -28,25 +28,25 @@ class EnhancedQuery(BaseModel):
 
 # DSPy Signatures for structured query understanding
 class IntentClassification(dspy.Signature):
-    """Classify user query intent into one of the predefined categories."""
+    """Classify user query intent into one of the predefined categories using full context."""
     user_query: str = dspy.InputField(desc="The user's query to classify")
-    conversation_history: str = dspy.InputField(desc="Previous conversation context")
+    conversation_history: str = dspy.InputField(desc="Full context object JSON containing conversation history, user context, and previous agent results")
     intent: str = dspy.OutputField(desc="Intent category: abcd_1, abcd_2, abcd_3, abcd_4, abcd_5, or UNKNOWN")
     confidence: float = dspy.OutputField(desc="Classification confidence between 0 and 1")
 
 class AmbiguityDetection(dspy.Signature):
-    """Detect if a query is ambiguous and needs clarification."""
+    """Detect if a query is ambiguous and needs clarification using full context."""
     user_query: str = dspy.InputField(desc="The user's query to analyze")
-    conversation_history: str = dspy.InputField(desc="Previous conversation context")
-    is_ambiguous: bool = dspy.OutputField(desc="Whether the query is ambiguous")
+    conversation_history: str = dspy.InputField(desc="Full context object JSON containing conversation history, user context, and previous agent results - check if this is a follow-up answer")
+    is_ambiguous: bool = dspy.OutputField(desc="Whether the query is ambiguous - should be False if this is answering a previous clarification")
     ambiguity_reason: str = dspy.OutputField(desc="Reason for ambiguity if applicable, empty if not ambiguous")
     clarification_question: str = dspy.OutputField(desc="Question to clarify ambiguity, empty if not ambiguous")
 
 class QueryEnhancement(dspy.Signature):
-    """Enhance a clear query by rewriting, creating variations, and expanding terms."""
-    user_query: str = dspy.InputField(desc="The original user query")
-    conversation_history: str = dspy.InputField(desc="Previous conversation context")
-    rewritten_query: str = dspy.OutputField(desc="Direct, keyword-based rewritten query")
+    """Enhance a clear query by rewriting, creating variations, and expanding terms using full context."""
+    user_query: str = dspy.InputField(desc="The original user query - may be combined with previous context for follow-up answers")
+    conversation_history: str = dspy.InputField(desc="Full context object JSON containing conversation history, user context, and previous agent results - use this to understand follow-up context")
+    rewritten_query: str = dspy.OutputField(desc="Direct, keyword-based rewritten query that combines current query with previous context if this is a follow-up")
     query_variations: str = dspy.OutputField(desc="Comma-separated list of query variations")
     expansion_terms: str = dspy.OutputField(desc="Comma-separated list of related terms and synonyms")
 
@@ -71,6 +71,12 @@ class ConversationSummarization(dspy.Signature):
 
 SYSTEM_PROMPT = """You are a Query Understanding Agent responsible for analyzing user queries and preparing them for downstream processing.
 
+CRITICAL: You will receive a full context object JSON that contains conversation history, user context, and previous agent results. 
+Use this context to understand if the current query is:
+1. A standalone new query
+2. A follow-up answer to a previous clarification request
+3. Part of an ongoing conversation
+
 Your tasks are:
 1. Intent Classification: Classify the intent into one of: abcd_1, abcd_2, abcd_3, abcd_4, abcd_5, or UNKNOWN
    - abcd_1: Factual information requests
@@ -80,17 +86,22 @@ Your tasks are:
    - abcd_5: Complex multi-step queries
    - UNKNOWN: Unclear or unclassifiable queries
 
-2. Ambiguity Detection: Examine the query for:
-   - Vague terms or concepts
-   - Unresolved entities or pronouns
-   - Missing context or information
-   - Multiple possible interpretations
+2. Ambiguity Detection: 
+   - Check conversation_history for previous clarification requests
+   - If current query answers a previous clarification, mark as NOT ambiguous
+   - Otherwise examine the query for vague terms, missing context, multiple interpretations
 
-3. Query Enhancement: If the query is clear:
+3. Query Enhancement: For clear queries or follow-up answers:
+   - Combine current query with previous context if this is a follow-up
    - Resolve pronouns using conversation history
    - Rewrite into direct, keyword-based query
    - Generate query variations
    - Provide expansion terms (synonyms, related concepts)
+
+IMPORTANT: Look for patterns like:
+- Previous query needed clarification about "aspects" or "what specifically"
+- Current query provides aspects/details (e.g., "performance, syntax, learning curve")
+- This should be treated as a complete, non-ambiguous query by combining contexts
 
 Return your response in the exact JSON format specified, with all required fields.
 """
@@ -220,29 +231,8 @@ class QueryUnderstandingAgent(Runnable):
                     short_term_memory["summary"] = ""
             
             # Update topic if it was "none" (first interaction)
-            if short_term_memory["current_topic"] == "none":
+            if short_term_memory.get("current_topic") == "none":
                 short_term_memory["current_topic"] = topic_change["new_topic"]
-    
-    def _get_relevant_context(self, user_context: Dict[str, Any]) -> str:
-        """Get relevant conversation context from short_term_memory."""
-        short_term_memory = self._get_short_term_memory(user_context)
-        
-        context_parts = []
-        
-        # Add summary if available
-        if short_term_memory.get("summary"):
-            context_parts.append(f"Previous conversation summary: {short_term_memory['summary']}")
-        
-        # Add recent turns
-        recent_turns = short_term_memory.get("recent_turns", [])
-        if recent_turns:
-            turns_str = "\n".join([
-                f"{turn.get('role', 'unknown')}: {turn.get('content', '')}"
-                for turn in recent_turns
-            ])
-            context_parts.append(f"Recent conversation:\n{turns_str}")
-        
-        return "\n\n".join(context_parts) if context_parts else "No previous conversation"
     
     def invoke(self, context: ContextObject, config=None) -> ContextObject:
         """Process the context through DSPy-powered query understanding with conversation management."""
@@ -258,11 +248,11 @@ class QueryUnderstandingAgent(Runnable):
             # Initialize/get short_term_memory
             short_term_memory = self._get_short_term_memory(context.user_context)
             
-            # Step 1: Classify intent (using raw context for now)
-            temp_context = str(raw_conversation_history) if raw_conversation_history else "No previous conversation"
+            # Step 1: Classify intent using full context object
+            full_context_json = json.dumps(context.model_dump(), indent=2, default=str)
             intent_result = self.intent_classifier(
                 user_query=user_query,
-                conversation_history=temp_context
+                conversation_history=full_context_json
             )
             
             # Step 2: Detect topic changes
@@ -279,21 +269,18 @@ class QueryUnderstandingAgent(Runnable):
                 conversation_history=raw_conversation_history
             )
             
-            # Step 4: Get relevant context from short_term_memory
-            relevant_context = self._get_relevant_context(context.user_context)
-            
-            # Step 5: Check for ambiguity using filtered context
+            # Step 4: Check for ambiguity using full context object
             ambiguity_result = self.ambiguity_detector(
                 user_query=user_query,
-                conversation_history=relevant_context
+                conversation_history=full_context_json
             )
             
-            # Step 6: Enhance query if not ambiguous, using filtered context
+            # Step 5: Enhance query if not ambiguous - DSPy handles all context automatically
             enhanced_query = None
             if not ambiguity_result.is_ambiguous:
                 enhancement_result = self.query_enhancer(
                     user_query=user_query,
-                    conversation_history=relevant_context
+                    conversation_history=full_context_json
                 )
                 
                 # Parse comma-separated strings into lists
@@ -306,8 +293,8 @@ class QueryUnderstandingAgent(Runnable):
                     "query_variations": query_variations,
                     "expansion_terms": expansion_terms
                 }
-            
-            # Construct the result in the expected format
+                
+            # Construct the result - DSPy handles all logic automatically
             result = {
                 "intent": intent_result.intent,
                 "confidence": float(intent_result.confidence),

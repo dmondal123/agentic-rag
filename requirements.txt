@@ -5,3 +5,4 @@ langchain-litellm
 python-dotenv
 pydantic
 dspy-ai
+openai

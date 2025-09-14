@@ -30,33 +30,7 @@ class InteractiveRAGSystem:
     def print_agent_input(self, agent_name: str, input_data: Any):
         """Print formatted agent input."""
         self.print_separator(f"📥 {agent_name} INPUT", "─", 50)
-        
-        if isinstance(input_data, ContextObject):
-            print(f"🔍 User Query: {input_data.user_query}")
-            print(f"🔍 Current Stage: {input_data.current_stage}")
-            
-            if input_data.user_context:
-                print(f"🔍 User Context:")
-                for key, value in input_data.user_context.items():
-                    if isinstance(value, list) and len(value) > 0:
-                        print(f"   - {key}: {len(value)} items")
-                        if key == "conversation_history" and value:
-                            print(f"     Latest: {str(value[-1])[:100]}...")
-                    elif isinstance(value, dict) and value:
-                        print(f"   - {key}: {json.dumps(value, indent=6)}")
-                    else:
-                        print(f"   - {key}: {value}")
-            
-            # Show previous agent outputs if available
-            if input_data.query_understanding:
-                print(f"🔍 Previous Query Understanding: Available")
-            if input_data.planning:
-                print(f"🔍 Previous Planning: Available")
-            if input_data.execution:
-                print(f"🔍 Previous Execution: Available")
-                
-        else:
-            print(f"🔍 Input: {json.dumps(input_data, indent=2, default=str)}")
+        print(f"🔍 Input: {json.dumps(input_data, indent=2, default=str)}")
     
     def print_agent_output(self, agent_name: str, output_data: Any):
         """Print formatted agent output."""
@@ -177,7 +151,7 @@ class InteractiveRAGSystem:
                 return {
                     "status": "clarification_needed",
                     "message": planning_result.get("message_to_user"),
-                    "context_object": context.dict()
+                    "context_object": context.model_dump()
                 }
             
             # Step 4: Execution Agent (only if PROCEED_TO_EXECUTE)
@@ -199,7 +173,7 @@ class InteractiveRAGSystem:
                     "status": "completed",
                     "fused_context": context.execution.get("fused_context"),
                     "sources": context.execution.get("sources"),
-                    "context_object": context.dict()
+                    "context_object": context.model_dump()
                 }
             
             # Unexpected case
@@ -207,7 +181,7 @@ class InteractiveRAGSystem:
             return {
                 "status": "error",
                 "error": "Unexpected planning action or missing action",
-                "context_object": context.dict()
+                "context_object": context.model_dump()
             }
             
         except Exception as e:
@@ -283,7 +257,10 @@ class InteractiveRAGSystem:
                     "conversation_history": session_history[-5:],  # Keep last 5 interactions
                     "short_term_memory": {
                         "session_length": len(session_history),
-                        "last_query": session_history[-1].get("user") if session_history else None
+                        "last_query": session_history[-1].get("user") if session_history else None,
+                        "summary": "",
+                        "recent_turns": [],
+                        "current_topic": "none"
                     },
                     "user_feedback": []
                 }

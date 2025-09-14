@@ -1,7 +1,8 @@
-"""Execution Agent for tool execution, data collection, and synthesis with HyDE."""
+"""Execution Agent for tool execution, data collection, and synthesis with HyDE and Sparse Context Selection."""
 
 import json
 import os
+import asyncio
 import numpy as np
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field
@@ -39,6 +40,264 @@ class HyDEGeneration(dspy.Signature):
     context: str = dspy.InputField(desc="Additional context about the domain or topic")
     hypothetical_document: str = dspy.OutputField(desc="A detailed hypothetical document that would contain the answer to the query")
 
+# New classes for Sparse Context Selection
+class EncodedDocument(BaseModel):
+    """Enhanced document representation with embedding and attention metadata."""
+    content: str
+    source_id: str
+    tool_name: str
+    embedding: Optional[List[float]] = None
+    relevance_score: float = 0.0
+    attention_weight: float = 1.0
+    processing_priority: str = "medium"
+
+class ControlTokens(BaseModel):
+    """Control tokens for guiding sparse attention selection."""
+    high_priority_docs: List[int] = Field(default_factory=list)
+    medium_priority_docs: List[int] = Field(default_factory=list) 
+    skip_docs: List[int] = Field(default_factory=list)
+    attention_strategy: str = "focused"
+    max_contexts: int = 4
+
+class ParallelDocumentEncoder:
+    """Encode retrieved documents in parallel using OpenAI embeddings."""
+    
+    def __init__(self):
+        self.batch_size = 8  # Process 8 documents simultaneously
+        self.embedding_model = "text-embedding-3-small"  # OpenAI embedding model
+        
+        # Initialize OpenAI client
+        try:
+            from openai import AsyncOpenAI
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                print("Warning: OPENAI_API_KEY not found. Embeddings will be disabled.")
+                self.openai_client = None
+            else:
+                self.openai_client = AsyncOpenAI(api_key=api_key)
+        except ImportError:
+            print("Warning: OpenAI package not found. Install with: pip install openai")
+            self.openai_client = None
+        except Exception as e:
+            print(f"Warning: Could not initialize OpenAI client: {e}")
+            self.openai_client = None
+        
+    async def encode_documents_parallel(self, tool_results: List[ToolResult]) -> List[EncodedDocument]:
+        """Encode all documents in parallel batches using OpenAI embeddings."""
+        
+        # If no OpenAI client, return basic encoded docs without embeddings
+        if not self.openai_client:
+            return [EncodedDocument(
+                content=result.content,
+                source_id=result.source_id,
+                tool_name=result.tool_name,
+                relevance_score=result.relevance_score,
+                embedding=None  # No embeddings available
+            ) for result in tool_results]
+        
+        # Group documents into batches for parallel processing
+        document_batches = [tool_results[i:i+self.batch_size] 
+                           for i in range(0, len(tool_results), self.batch_size)]
+        
+        # Process all batches concurrently
+        encoding_tasks = [
+            self._encode_batch_with_openai(batch) for batch in document_batches
+        ]
+        
+        batch_results = await asyncio.gather(*encoding_tasks, return_exceptions=True)
+        
+        # Flatten results and handle exceptions
+        encoded_docs = []
+        for batch_result in batch_results:
+            if isinstance(batch_result, Exception):
+                print(f"Warning: Batch encoding failed: {batch_result}")
+                continue
+            encoded_docs.extend(batch_result)
+            
+        return encoded_docs
+    
+    async def _encode_batch_with_openai(self, batch: List[ToolResult]) -> List[EncodedDocument]:
+        """Encode a batch of documents using OpenAI embeddings API."""
+        contents = [result.content for result in batch]
+        
+        try:
+            # Generate embeddings using OpenAI API
+            response = await self.openai_client.embeddings.create(
+                model=self.embedding_model,
+                input=contents,
+                encoding_format="float"
+            )
+            
+            # Extract embeddings from response
+            embeddings = []
+            for embedding_data in response.data:
+                embeddings.append(embedding_data.embedding)
+                
+        except Exception as e:
+            print(f"Warning: OpenAI embedding generation failed: {e}")
+            embeddings = [None] * len(contents)
+        
+        # Create encoded documents
+        encoded_docs = []
+        for i, result in enumerate(batch):
+            encoded_doc = EncodedDocument(
+                content=result.content,
+                source_id=result.source_id,
+                tool_name=result.tool_name,
+                embedding=embeddings[i] if i < len(embeddings) and embeddings[i] is not None else None,
+                relevance_score=result.relevance_score
+            )
+            encoded_docs.append(encoded_doc)
+            
+        return encoded_docs
+
+class ControlTokenGenerator:
+    """Generate control tokens to guide sparse attention selection."""
+    
+    def __init__(self):
+        self.token_llm = get_llm()  # Use fast model for control token generation
+        
+    async def generate_control_tokens(self, enhanced_query: Dict[str, Any], encoded_documents: List[EncodedDocument]) -> ControlTokens:
+        """Generate control tokens based on query intent and document relevance."""
+        
+        # Create document summaries for token generation
+        doc_summaries = []
+        for i, doc in enumerate(encoded_documents):
+            summary = f"Doc {i}: {doc.content[:150]}... (relevance: {doc.relevance_score:.3f})"
+            doc_summaries.append(summary)
+        
+        control_prompt = f"""You are an AI assistant that analyzes documents and selects the most relevant ones for a query.
+
+Query: {enhanced_query.get('rewritten_query', 'No enhanced query')}
+
+Available documents ({len(encoded_documents)} total):
+{chr(10).join(doc_summaries)}
+
+Analyze the documents and select the most relevant ones. Consider relevance scores and content overlap with the query.
+
+You MUST respond with ONLY valid JSON in this exact format:
+{{
+    "high_priority_docs": [0, 1],
+    "medium_priority_docs": [2], 
+    "skip_docs": [3, 4],
+    "attention_strategy": "focused",
+    "max_contexts": 4
+}}
+
+Rules:
+- high_priority_docs: Document indices of most relevant documents (up to 3)
+- medium_priority_docs: Document indices for supporting information (up to 2)
+- skip_docs: Document indices to ignore (low relevance or redundant)
+- attention_strategy: Always use "focused"
+- max_contexts: Total documents to use (typically 3-5)
+- Use only document indices from 0 to {len(encoded_documents)-1}
+
+Respond with ONLY the JSON object, no other text."""
+        
+        try:
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.token_llm.invoke([{"role": "user", "content": control_prompt}])
+            )
+            
+            # Clean and parse JSON response
+            response_content = response.content.strip()
+            
+            # Remove any markdown formatting if present
+            if response_content.startswith('```'):
+                lines = response_content.split('\n')
+                # Find the first line that starts with {
+                json_start = 0
+                for i, line in enumerate(lines):
+                    if line.strip().startswith('{'):
+                        json_start = i
+                        break
+                # Find the last line that ends with }
+                json_end = len(lines)
+                for i in range(len(lines)-1, -1, -1):
+                    if lines[i].strip().endswith('}'):
+                        json_end = i + 1
+                        break
+                response_content = '\n'.join(lines[json_start:json_end])
+            
+            # Parse JSON response
+            try:
+                control_data = json.loads(response_content)
+            except json.JSONDecodeError as json_error:
+                print(f"JSON parsing failed: {json_error}")
+                print(f"Response content: {response_content[:200]}...")
+                raise json_error
+                
+            # Validate document indices
+            max_index = len(encoded_documents) - 1
+            valid_control_data = {}
+            
+            for key in ['high_priority_docs', 'medium_priority_docs', 'skip_docs']:
+                if key in control_data:
+                    # Filter out invalid indices
+                    valid_indices = [idx for idx in control_data[key] 
+                                   if isinstance(idx, int) and 0 <= idx <= max_index]
+                    valid_control_data[key] = valid_indices
+                else:
+                    valid_control_data[key] = []
+            
+            valid_control_data['attention_strategy'] = control_data.get('attention_strategy', 'focused')
+            valid_control_data['max_contexts'] = min(control_data.get('max_contexts', 4), len(encoded_documents))
+            
+            return ControlTokens(**valid_control_data)
+            
+        except Exception as e:
+            print(f"Warning: Control token generation failed: {e}")
+            # Enhanced fallback: select top documents by relevance score
+            sorted_docs = sorted(enumerate(encoded_documents), 
+                               key=lambda x: x[1].relevance_score, reverse=True)
+            
+            # Smart fallback selection
+            total_docs = len(encoded_documents)
+            high_count = min(2, total_docs)
+            medium_count = min(2, max(0, total_docs - high_count))
+            
+            return ControlTokens(
+                high_priority_docs=[i for i, _ in sorted_docs[:high_count]],
+                medium_priority_docs=[i for i, _ in sorted_docs[high_count:high_count + medium_count]],
+                skip_docs=[i for i, _ in sorted_docs[high_count + medium_count:]],
+                attention_strategy="focused",
+                max_contexts=min(4, total_docs)
+            )
+
+class SparseContextSelector:
+    """Select optimal contexts based on control tokens and relevance scores."""
+    
+    def select_contexts(self, encoded_documents: List[EncodedDocument], control_tokens: ControlTokens) -> List[EncodedDocument]:
+        """Apply sparse selection based on control tokens."""
+        
+        selected_contexts = []
+        
+        # High priority documents (full attention)
+        for doc_idx in control_tokens.high_priority_docs:
+            if doc_idx < len(encoded_documents):
+                doc = encoded_documents[doc_idx].copy()
+                doc.attention_weight = 1.0
+                doc.processing_priority = "high"
+                selected_contexts.append(doc)
+        
+        # Medium priority documents (reduced attention) 
+        for doc_idx in control_tokens.medium_priority_docs:
+            if doc_idx < len(encoded_documents):
+                doc = encoded_documents[doc_idx].copy()
+                doc.attention_weight = 0.6
+                doc.processing_priority = "medium"
+                selected_contexts.append(doc)
+        
+        # Limit total contexts to prevent latency
+        max_contexts = control_tokens.max_contexts
+        selected_contexts = selected_contexts[:max_contexts]
+        
+        # Sort by attention weight for processing order
+        selected_contexts.sort(key=lambda x: x.attention_weight, reverse=True)
+        
+        return selected_contexts
+
 SYSTEM_PROMPT = """You are an Execution Agent responsible for executing the planned tools and synthesizing results.
 
 Your tasks:
@@ -53,7 +312,7 @@ Provide a comprehensive synthesis with proper citations in the format [Source: s
 """
 
 class ExecutionAgent(Runnable):
-    """HyDE-powered agent for executing tools and synthesizing results."""
+    """HyDE-powered agent for executing tools and synthesizing results with Sparse Context Selection."""
     
     def __init__(self):
         self.llm = get_llm()
@@ -78,20 +337,28 @@ class ExecutionAgent(Runnable):
         # Initialize mock document store (in production, this would be your vector DB)
         self.document_store = self._initialize_mock_documents()
         
+        # Initialize Sparse Context Selection components
+        self.use_sparse_context = os.getenv("ENABLE_SPARSE_CONTEXT", "true").lower() == "true"
+        self.document_encoder = ParallelDocumentEncoder()
+        self.context_selector = SparseContextSelector()
+        self.control_token_generator = ControlTokenGenerator()
+        
         self.prompt = PromptTemplate(
-            input_variables=["user_query", "enhanced_query", "execution_plan", "tool_results"],
+            input_variables=["context_object", "tool_results"],
             template=SYSTEM_PROMPT + """
 
-Original User Query: {user_query}
-Enhanced Query: {enhanced_query}
-Execution Plan: {execution_plan}
-Tool Results: {tool_results}
+FULL CONTEXT OBJECT INPUT:
+{context_object}
+
+TOOL RETRIEVAL RESULTS:
+{tool_results}
 
 Synthesize the tool results into a comprehensive response that:
-1. Directly addresses the user's query
+1. Directly addresses the user's original query from the context
 2. Integrates information from all sources
-3. Includes proper citations for each piece of information
+3. Includes proper citations for each piece of information  
 4. Maintains coherent flow and logical structure
+5. Uses the enhanced query information for better synthesis
 
 Response format:
 {{
@@ -225,8 +492,109 @@ Response format:
         
         return all_results
     
+    async def _execute_tools_with_sparse_context(self, context: ContextObject, plan: List[Dict[str, Any]], enhanced_query: Dict[str, Any], user_context: Dict[str, Any]) -> ExecutionOutput:
+        """Execute tools with Sparse Context Selection for enhanced performance."""
+        
+        # Step 1: Execute HyDE retrieval (existing method)
+        tool_results = self._execute_tools_with_hyde(plan, enhanced_query, user_context)
+        
+        if not tool_results:
+            return ExecutionOutput(
+                fused_context="No relevant documents found for the query.",
+                sources=[]
+            )
+        
+        # Step 2: Parallel document encoding
+        encoded_documents = await self.document_encoder.encode_documents_parallel(tool_results)
+        
+        # Step 3: Generate control tokens for context selection  
+        control_tokens = await self.control_token_generator.generate_control_tokens(enhanced_query, encoded_documents)
+        
+        # Step 4: Select sparse contexts based on control tokens
+        selected_contexts = self.context_selector.select_contexts(encoded_documents, control_tokens)
+        
+        # Step 5: Enhanced synthesis with sparse contexts
+        return await self._synthesize_with_sparse_context(context, selected_contexts, enhanced_query)
+    
+    async def _synthesize_with_sparse_context(self, context: ContextObject, sparse_contexts: List[EncodedDocument], enhanced_query: Dict[str, Any]) -> ExecutionOutput:
+        """Synthesize response using sparse contexts with weighted attention."""
+        
+        if not sparse_contexts:
+            return ExecutionOutput(
+                fused_context="No contexts selected for synthesis.",
+                sources=[]
+            )
+        
+        # Build weighted contexts for synthesis
+        weighted_contexts = []
+        sources = []
+        
+        for i, ctx in enumerate(sparse_contexts):
+            weight = ctx.attention_weight
+            priority = ctx.processing_priority
+            
+            # Format context with attention indicators
+            formatted_context = f"""
+            [Priority: {priority.upper()}] [Attention Weight: {weight:.1f}]
+            Source: {ctx.source_id} | Tool: {ctx.tool_name}
+            Content: {ctx.content}
+            Relevance Score: {ctx.relevance_score:.3f}
+            """
+            weighted_contexts.append(formatted_context)
+            
+            # Build sources for response
+            sources.append({
+                "source_id": ctx.source_id,
+                "tool": ctx.tool_name,
+                "sub_query": f"Enhanced query with {priority} priority",
+                "content_snippet": ctx.content[:200] + "..." if len(ctx.content) > 200 else ctx.content,
+                "metadata": {
+                    "attention_weight": weight,
+                    "processing_priority": priority,
+                    "relevance_score": ctx.relevance_score
+                }
+            })
+        
+        # Enhanced synthesis using the chain with full context object
+        try:
+            # Format sparse context results as tool results for consistency
+            sparse_tool_results = []
+            for ctx in sparse_contexts:
+                sparse_tool_results.append({
+                    "tool_name": ctx.tool_name,
+                    "sub_query": f"Sparse context with {ctx.processing_priority} priority",
+                    "content": ctx.content,
+                    "source_id": ctx.source_id,
+                    "relevance_score": ctx.relevance_score,
+                    "attention_weight": ctx.attention_weight,
+                    "processing_priority": ctx.processing_priority
+                })
+            
+            # Use the chain for consistency with legacy mode
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.chain.invoke({
+                    "context_object": json.dumps(context.model_dump(), indent=2, default=str),
+                    "tool_results": json.dumps(sparse_tool_results, indent=2, default=str)
+                })
+            )
+            
+            return ExecutionOutput(
+                fused_context=result["fused_context"],
+                sources=result.get("sources", sources)  # Use generated sources or fallback
+            )
+            
+        except Exception as e:
+            print(f"Error in sparse context synthesis: {e}")
+            # Fallback to basic synthesis
+            basic_content = f"Error in synthesis: {str(e)}. Retrieved {len(sparse_contexts)} relevant contexts."
+            return ExecutionOutput(
+                fused_context=basic_content,
+                sources=sources
+            )
+    
     def invoke(self, context: ContextObject, config=None) -> ContextObject:
-        """Process the context through execution."""
+        """Process the context through execution with optional Sparse Context Selection."""
         try:
             # Check if planning was successful and action is PROCEED_TO_EXECUTE
             if not context.planning:
@@ -247,27 +615,59 @@ Response format:
                 
             enhanced_query = context.query_understanding.get("enhanced_query", {})
             
-            # Execute tools using HyDE for enhanced retrieval
-            tool_results = self._execute_tools_with_hyde(plan, enhanced_query, context.user_context)
+            # Choose execution method based on feature flag
+            if self.use_sparse_context:
+                # Use new Sparse Context Selection approach
+                import asyncio
+                try:
+                    # Run async method in sync context
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        result = loop.run_until_complete(
+                            self._execute_tools_with_sparse_context(context, plan, enhanced_query, context.user_context)
+                        )
+                    finally:
+                        loop.close()
+                        
+                    # Convert ExecutionOutput to dict for context
+                    context.execution = {
+                        "fused_context": result.fused_context,
+                        "sources": result.sources
+                    }
+                    
+                except Exception as sparse_error:
+                    print(f"Sparse context execution failed: {sparse_error}")
+                    # Fallback to original method
+                    result = self._execute_legacy_synthesis(context, plan, enhanced_query, context.user_context)
+                    context.execution = result
+                    
+            else:
+                # Use original HyDE method (legacy mode)
+                result = self._execute_legacy_synthesis(context, plan, enhanced_query, context.user_context)
+                context.execution = result
             
-            # Convert tool results to dict format for prompt
-            tool_results_dict = [result.dict() for result in tool_results]
-            
-            # Invoke the synthesis chain
-            result = self.chain.invoke({
-                "user_query": context.user_query,
-                "enhanced_query": json.dumps(enhanced_query),
-                "execution_plan": json.dumps(plan),
-                "tool_results": json.dumps(tool_results_dict)
-            })
-            
-            # Update context with results
-            context.execution = result
             context.current_stage = "execution_complete"
-            
             return context
             
         except Exception as e:
             context.error_occurred = True
             context.error_message = f"Execution Agent error: {str(e)}"
             return context
+    
+    def _execute_legacy_synthesis(self, context: ContextObject, plan: List[Dict[str, Any]], enhanced_query: Dict[str, Any], user_context: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute using the original HyDE method for backward compatibility."""
+        
+        # Execute tools using HyDE for enhanced retrieval
+        tool_results = self._execute_tools_with_hyde(plan, enhanced_query, user_context)
+        
+        # Convert tool results to dict format for prompt
+        tool_results_dict = [result.dict() for result in tool_results]
+        
+        # Invoke the synthesis chain with full context
+        result = self.chain.invoke({
+            "context_object": json.dumps(context.model_dump(), indent=2, default=str),
+            "tool_results": json.dumps(tool_results_dict, indent=2, default=str)
+        })
+        
+        return result
