@@ -1,0 +1,5 @@
+---
+description: always use a browser search specifically for anthropic news and blogs, openai blogs and cursor blogs and also research papers implementing new concepts in arxiv for better context on what is going on currently in the world. this is for when you want to search something that you do not have as much knowledge on
+globs:
+alwaysApply: false
+---

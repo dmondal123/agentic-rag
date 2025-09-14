@@ -1,0 +1,7 @@
+langchain
+langchain-community
+langchain-core
+langchain-litellm
+python-dotenv
+pydantic
+dspy-ai
