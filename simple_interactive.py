@@ -1,8 +1,14 @@
 """Simple interactive terminal for quick testing with basic agent I/O display."""
 
 import os
+import sys
 from typing import Dict, Any
+
+# Add utils to path  
+sys.path.append(os.path.dirname(__file__))
+
 from agents import create_orchestrated_chain
+from utils.logging_utils import setup_logger
 from dotenv import load_dotenv
 
 # Load environment variables

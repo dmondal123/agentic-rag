@@ -1,12 +1,26 @@
 """Orchestration Agent for managing the multi-agent RAG pipeline."""
 
+import sys
+import os
 from typing import Dict, Any, Optional
 from langchain_core.runnables import Runnable, RunnableSequence, RunnableBranch, RunnableLambda
+
+# Add utils to path
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from .base_agent import ContextObject
 from .query_understanding_agent import QueryUnderstandingAgent
 from .planning_agent import PlanningAgent
 from .execution_agent import ExecutionAgent
+from utils.response_utils import (
+    format_error_response,
+    format_clarification_response,
+    format_completion_response,
+    check_for_errors,
+    should_clarify
+)
+from utils.validation_utils import validate_input_data
+from utils.logging_utils import setup_logger, log_agent_step, log_error
 
 def _initialize_context(input_data: Dict[str, Any]) -> ContextObject:
     """Initialize context object from input data."""
@@ -16,44 +30,11 @@ def _initialize_context(input_data: Dict[str, Any]) -> ContextObject:
         current_stage="initialization"
     )
 
-def _check_for_errors(context: ContextObject) -> bool:
-    """Check if context has errors."""
-    return context.error_occurred
-
-def _format_error_response(context: ContextObject) -> Dict[str, Any]:
-    """Format error response consistently."""
-    return {
-        "status": "error",
-        "error": context.error_message,
-        "context_object": context.dict()
-    }
-
-def _should_clarify(context: ContextObject) -> bool:
-    """Check if planning agent returned CLARIFY action."""
-    planning_result = context.planning
-    return planning_result and planning_result.get("action") == "CLARIFY"
-
-def _format_clarification_response(context: ContextObject) -> Dict[str, Any]:
-    """Format clarification response."""
-    return {
-        "status": "clarification_needed",
-        "message": context.planning.get("message_to_user"),
-        "context_object": context.dict()
-    }
-
-def _format_completion_response(context: ContextObject) -> Dict[str, Any]:
-    """Format successful completion response."""
-    return {
-        "status": "completed",
-        "fused_context": context.execution.get("fused_context"),
-        "sources": context.execution.get("sources"),
-        "context_object": context.dict()
-    }
-
 class OrchestrationAgent(Runnable):
     """Main orchestration agent using RunnableBranch for conditional flow."""
     
     def __init__(self):
+        self.logger = setup_logger("orchestration_agent")
         self.query_understanding_agent = QueryUnderstandingAgent()
         self.planning_agent = PlanningAgent()
         self.execution_agent = ExecutionAgent()
@@ -65,32 +46,32 @@ class OrchestrationAgent(Runnable):
             | RunnableBranch(
                 # Branch 1: If error occurred during query understanding
                 (
-                    lambda context: _check_for_errors(context),
-                    RunnableLambda(_format_error_response)
+                    check_for_errors,
+                    RunnableLambda(format_error_response)
                 ),
                 # Branch 2: Continue to planning agent
                 self.planning_agent
                 | RunnableBranch(
                     # Sub-branch 1: If error occurred during planning
                     (
-                        lambda context: _check_for_errors(context),
-                        RunnableLambda(_format_error_response)
+                        check_for_errors,
+                        RunnableLambda(format_error_response)
                     ),
                     # Sub-branch 2: If clarification is needed
                     (
-                        lambda context: _should_clarify(context),
-                        RunnableLambda(_format_clarification_response)
+                        should_clarify,
+                        RunnableLambda(format_clarification_response)
                     ),
                     # Sub-branch 3: Proceed to execution (default)
                     self.execution_agent
                     | RunnableBranch(
                         # Final error check
                         (
-                            lambda context: _check_for_errors(context),
-                            RunnableLambda(_format_error_response)
+                            check_for_errors,
+                            RunnableLambda(format_error_response)
                         ),
                         # Success response
-                        RunnableLambda(_format_completion_response)
+                        RunnableLambda(format_completion_response)
                     )
                 )
             )
@@ -107,14 +88,26 @@ class OrchestrationAgent(Runnable):
             Dictionary with final results or clarification request
         """
         try:
+            # Validate input data
+            is_valid, error_message = validate_input_data(input_data)
+            if not is_valid:
+                log_error(self.logger, "Input validation", ValueError(error_message))
+                return format_error_response(
+                    {"error_message": f"Invalid input: {error_message}"}, 
+                    error_message=f"Invalid input: {error_message}"
+                )
+            
+            log_agent_step(self.logger, "Orchestration", "Starting pipeline execution")
             result = self.chain.invoke(input_data, config)
+            log_agent_step(self.logger, "Orchestration", "Pipeline execution completed")
             return result
+            
         except Exception as e:
-            return {
-                "status": "error",
-                "error": f"Orchestration error: {str(e)}",
-                "context_object": None
-            }
+            log_error(self.logger, "Orchestration pipeline", e)
+            return format_error_response(
+                {"error_message": str(e)}, 
+                error_message=f"Orchestration error: {str(e)}"
+            )
 
 # Convenience function for easier usage
 def create_orchestrated_chain() -> OrchestrationAgent:

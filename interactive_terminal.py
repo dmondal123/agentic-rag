@@ -2,8 +2,15 @@
 
 import json
 import os
+import sys
 from typing import Dict, Any
+
+# Add utils to path
+sys.path.append(os.path.dirname(__file__))
+
 from agents import create_orchestrated_chain, ContextObject
+from utils.logging_utils import setup_logger, log_agent_step
+from utils.context_utils import sanitize_for_logging
 from agents.query_understanding_agent import QueryUnderstandingAgent
 from agents.planning_agent import PlanningAgent 
 from agents.execution_agent import ExecutionAgent

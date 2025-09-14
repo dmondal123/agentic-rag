@@ -1,13 +1,20 @@
 """Planning Agent for tool selection and execution plan generation."""
 
 import json
+import sys
+import os
 from typing import Dict, Any, Optional, List
 from pydantic import BaseModel, Field
 from langchain_core.runnables import Runnable
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 
+# Add utils to path
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
 from .base_agent import ContextObject, get_llm
+from utils.context_utils import format_context_json
+from utils.logging_utils import setup_logger, log_agent_step, log_error
 
 class PlanningOutput(BaseModel):
     """Output structure for Planning Agent."""
@@ -42,6 +49,7 @@ class PlanningAgent(Runnable):
     """Agent for planning query execution strategy."""
     
     def __init__(self):
+        self.logger = setup_logger("planning_agent")
         self.llm = get_llm()
         self.prompt = PromptTemplate(
             input_variables=["context_object"],
@@ -87,24 +95,30 @@ Response format:
     def invoke(self, context: ContextObject, config=None) -> ContextObject:
         """Process the context through planning."""
         try:
+            log_agent_step(self.logger, "Planning", "Starting plan generation")
+            
             # Check if query understanding was successful
             if not context.query_understanding:
+                error_msg = "Planning Agent: No query understanding results available"
+                log_error(self.logger, "Planning Agent", ValueError(error_msg))
                 context.error_occurred = True
-                context.error_message = "Planning Agent: No query understanding results available"
+                context.error_message = error_msg
                 return context
             
-            # Invoke the chain with full context object
+            # Invoke the chain with full context object using utils
             result = self.chain.invoke({
-                "context_object": json.dumps(context.model_dump(), indent=2, default=str)
+                "context_object": format_context_json(context)
             })
             
             # Update context with results
             context.planning = result
             context.current_stage = "planning_complete"
             
+            log_agent_step(self.logger, "Planning", "Plan generation completed")
             return context
             
         except Exception as e:
+            log_error(self.logger, "Planning Agent", e)
             context.error_occurred = True
             context.error_message = f"Planning Agent error: {str(e)}"
             return context

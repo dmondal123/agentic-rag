@@ -1,14 +1,8 @@
 """Base agent class and common utilities for the multi-agent RAG system."""
 
-import os
 from typing import Dict, Any, Optional
 from pydantic import BaseModel, Field
 from langchain_core.runnables import Runnable, RunnableConfig
-from langchain_litellm import ChatLiteLLM
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
 
 class ContextObject(BaseModel):
     """Stateful context object passed between agents."""
@@ -31,7 +25,21 @@ class ContextObject(BaseModel):
     error_occurred: bool = Field(default=False, description="Flag indicating if an error occurred")
     error_message: Optional[str] = Field(default=None, description="Error message if any")
 
-def get_llm():
-    """Get the configured LLM instance."""
-    model_name = os.getenv("MODEL_NAME", "gpt-4o")
-    return ChatLiteLLM(model=model_name, temperature=0.1)
+# Import the LLM utility function for backward compatibility
+try:
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+    from utils.llm_utils import get_llm
+except ImportError:
+    # Fallback for when utils module is not available
+    import os
+    from langchain_litellm import ChatLiteLLM
+    from dotenv import load_dotenv
+    
+    load_dotenv()
+    
+    def get_llm():
+        """Get the configured LLM instance."""
+        model_name = os.getenv("MODEL_NAME", "gpt-4o")
+        return ChatLiteLLM(model=model_name, temperature=0.1)

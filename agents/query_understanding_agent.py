@@ -1,6 +1,8 @@
 """Query Understanding Agent for intent classification, ambiguity detection, and query enhancement."""
 
 import json
+import sys
+import os
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field
 from langchain_core.runnables import Runnable
@@ -8,7 +10,18 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 import dspy
 
+# Add utils to path
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
 from .base_agent import ContextObject, get_llm
+from utils.context_utils import format_context_json, extract_conversation_history
+from utils.memory_utils import (
+    get_short_term_memory, 
+    detect_topic_change, 
+    manage_conversation_length, 
+    update_short_term_memory
+)
+from utils.logging_utils import setup_logger, log_agent_step, log_error
 
 class QueryUnderstandingOutput(BaseModel):
     """Output structure for Query Understanding Agent."""
@@ -140,20 +153,14 @@ class QueryUnderstandingAgent(Runnable):
         self.topic_detector = dspy.ChainOfThought(TopicChangeDetection)
         self.conversation_summarizer = dspy.ChainOfThought(ConversationSummarization)
         
+        # Initialize logger
+        self.logger = setup_logger("query_understanding_agent")
+        
         # Configuration for conversation management
         self.max_recent_turns = 6  # Keep last 6 turns in recent_turns
         self.max_summary_words = 150  # Summary word limit
         self.topic_change_threshold = 0.8  # Confidence threshold for topic changes (increased for less sensitivity)
     
-    def _get_short_term_memory(self, user_context: Dict[str, Any]) -> Dict[str, Any]:
-        """Get or initialize short_term_memory structure."""
-        if "short_term_memory" not in user_context:
-            user_context["short_term_memory"] = {
-                "summary": "",
-                "recent_turns": [],
-                "current_topic": "none"
-            }
-        return user_context["short_term_memory"]
     
     def _detect_topic_change(self, query: str, intent: str, short_term_memory: Dict[str, Any]) -> Dict[str, Any]:
         """Detect if the current query represents a topic change."""
@@ -237,33 +244,31 @@ class QueryUnderstandingAgent(Runnable):
     def invoke(self, context: ContextObject, config=None) -> ContextObject:
         """Process the context through DSPy-powered query understanding with conversation management."""
         try:
-            # Extract conversation history and initialize short_term_memory
-            raw_conversation_history = context.user_context.get("conversation_history", [])
+            log_agent_step(self.logger, "QueryUnderstanding", "Starting query processing")
+            
+            # Extract conversation history using utils
+            raw_conversation_history = extract_conversation_history(context.user_context)
             user_query = context.user_query
             
-            # Ensure conversation_history is a list
-            if isinstance(raw_conversation_history, str):
-                raw_conversation_history = []
-            
-            # Initialize/get short_term_memory
-            short_term_memory = self._get_short_term_memory(context.user_context)
+            # Initialize/get short_term_memory using utils
+            short_term_memory = get_short_term_memory(context.user_context)
             
             # Step 1: Classify intent using full context object
-            full_context_json = json.dumps(context.model_dump(), indent=2, default=str)
+            full_context_json = format_context_json(context)
             intent_result = self.intent_classifier(
                 user_query=user_query,
                 conversation_history=full_context_json
             )
             
-            # Step 2: Detect topic changes
-            topic_change = self._detect_topic_change(
+            # Step 2: Detect topic changes using utils
+            topic_change = detect_topic_change(
                 query=user_query,
                 intent=intent_result.intent,
                 short_term_memory=short_term_memory
             )
             
-            # Step 3: Update short_term_memory based on topic changes and conversation length
-            self._update_short_term_memory(
+            # Step 3: Update short_term_memory using utils
+            update_short_term_memory(
                 user_context=context.user_context,
                 topic_change=topic_change,
                 conversation_history=raw_conversation_history
@@ -313,6 +318,8 @@ class QueryUnderstandingAgent(Runnable):
             return context
             
         except Exception as e:
+            # Handle errors gracefully with proper logging
+            log_error(self.logger, "DSPy Query Understanding Agent", e)
             context.error_occurred = True
             context.error_message = f"DSPy Query Understanding Agent error: {str(e)}"
             return context

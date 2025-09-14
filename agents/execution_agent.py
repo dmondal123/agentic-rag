@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import asyncio
 import numpy as np
 from typing import Dict, Any, List, Optional
@@ -11,7 +12,13 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 import dspy
 
+# Add utils to path
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
 from .base_agent import ContextObject, get_llm
+from utils.context_utils import format_context_json
+from utils.memory_utils import get_relevant_memory_context
+from utils.logging_utils import setup_logger, log_agent_step, log_error, log_warning
 
 class ExecutionOutput(BaseModel):
     """Output structure for Execution Agent."""
@@ -63,6 +70,7 @@ class ParallelDocumentEncoder:
     """Encode retrieved documents in parallel using OpenAI embeddings."""
     
     def __init__(self):
+        self.logger = setup_logger("document_encoder")
         self.batch_size = 8  # Process 8 documents simultaneously
         self.embedding_model = "text-embedding-3-small"  # OpenAI embedding model
         
@@ -71,15 +79,15 @@ class ParallelDocumentEncoder:
             from openai import AsyncOpenAI
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
-                print("Warning: OPENAI_API_KEY not found. Embeddings will be disabled.")
+                log_warning(self.logger, "OpenAI Setup", "OPENAI_API_KEY not found. Embeddings will be disabled.")
                 self.openai_client = None
             else:
                 self.openai_client = AsyncOpenAI(api_key=api_key)
         except ImportError:
-            print("Warning: OpenAI package not found. Install with: pip install openai")
+            log_warning(self.logger, "OpenAI Setup", "OpenAI package not found. Install with: pip install openai")
             self.openai_client = None
         except Exception as e:
-            print(f"Warning: Could not initialize OpenAI client: {e}")
+            log_warning(self.logger, "OpenAI Setup", f"Could not initialize OpenAI client: {e}")
             self.openai_client = None
         
     async def encode_documents_parallel(self, tool_results: List[ToolResult]) -> List[EncodedDocument]:
@@ -315,6 +323,7 @@ class ExecutionAgent(Runnable):
     """HyDE-powered agent for executing tools and synthesizing results with Sparse Context Selection."""
     
     def __init__(self):
+        self.logger = setup_logger("execution_agent")
         self.llm = get_llm()
         
         # Initialize DSPy for HyDE
