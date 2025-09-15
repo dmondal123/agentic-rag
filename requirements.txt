@@ -4,5 +4,9 @@ langchain-core
 langchain-litellm
 python-dotenv
 pydantic
-dspy-ai
+llama-index
+llama-index-core
 openai
+asyncpg
+aiohttp
+psycopg2-binary

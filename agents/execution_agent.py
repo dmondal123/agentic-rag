@@ -10,7 +10,6 @@ from pydantic import BaseModel, Field
 from langchain_core.runnables import Runnable
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
-import dspy
 
 # Add utils to path
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -19,7 +18,7 @@ from .base_agent import ContextObject, get_llm
 from utils.context_utils import format_context_json
 from utils.memory_utils import get_relevant_memory_context
 from utils.logging_utils import setup_logger, log_agent_step, log_error, log_warning
-from retrieval_utils import get_retriever, get_top_k_chunks, PGVectorRetriever
+from retrieval_utils import get_retriever, get_top_k_chunks, PGVectorRetriever, get_async_retriever
 
 class ExecutionOutput(BaseModel):
     """Output structure for Execution Agent."""
@@ -36,12 +35,7 @@ class ToolResult(BaseModel):
 
     embedding: Optional[List[float]] = None
 
-# DSPy Signature for HyDE - generates hypothetical documents
-class HyDEGeneration(dspy.Signature):
-    """Generate a hypothetical document that would answer the given query."""
-    query: str = dspy.InputField(desc="The search query or question")
-    context: str = dspy.InputField(desc="Additional context about the domain or topic")
-    hypothetical_document: str = dspy.OutputField(desc="A detailed hypothetical document that would contain the answer to the query")
+# Simple retrieval system without HyDE
 
 # New classes for Sparse Context Selection
 class EncodedDocument(BaseModel):
@@ -316,44 +310,28 @@ Provide a comprehensive synthesis with proper citations in the format [Source: s
 """
 
 class ExecutionAgent(Runnable):
-    """HyDE-powered agent for executing tools and synthesizing results with Sparse Context Selection."""
+    """Simple retrieval agent for executing tools and synthesizing results with optional Sparse Context Selection."""
     
     def __init__(self):
         self.logger = setup_logger("execution_agent")
         self.llm = get_llm()
         
-        # Initialize DSPy for HyDE
-        model_name = os.getenv("MODEL_NAME", "gpt-4o")
-        api_key = os.getenv("OPENAI_API_KEY")
-        
-        try:
-            lm = dspy.LM(model=model_name, api_key=api_key, temperature=0.1)
-            dspy.configure(lm=lm)
-        except:
-            try:
-                lm = dspy.LM(f"openai/{model_name}", api_key=api_key)
-                dspy.configure(lm=lm)
-            except:
-                dspy.configure()
-        
-        # Initialize HyDE module
-        self.hyde_generator = dspy.ChainOfThought(HyDEGeneration)
-        
         # Initialize PostgreSQL/pgvector retriever (required)
         try:
-            self.retriever = get_retriever(k=10)  # Get more results for better HyDE selection
+            self.retriever = get_retriever(k=10)  # Get more results for better selection
             log_agent_step(self.logger, "Execution", "Successfully initialized PostgreSQL retriever")
         except Exception as e:
             error_msg = f"Failed to initialize PostgreSQL retriever: {e}"
             log_error(self.logger, "PostgreSQL Setup", e)
             raise RuntimeError(f"ExecutionAgent requires PostgreSQL connection. {error_msg}") from e
         
-        # Initialize Sparse Context Selection components
-        self.use_sparse_context = os.getenv("ENABLE_SPARSE_CONTEXT", "true").lower() == "true"
-        self.use_hyde_retrieval = os.getenv("USE_HYDE_RETRIEVAL", "true").lower() == "true"
-        self.document_encoder = ParallelDocumentEncoder()
-        self.context_selector = SparseContextSelector()
-        self.control_token_generator = ControlTokenGenerator()
+        # Initialize Sparse Context Selection components (optional)
+        self.use_sparse_context = os.getenv("ENABLE_SPARSE_CONTEXT", "false").lower() == "true"
+        if self.use_sparse_context:
+            self.document_encoder = ParallelDocumentEncoder()
+            self.context_selector = SparseContextSelector()
+            self.control_token_generator = ControlTokenGenerator()
+            log_agent_step(self.logger, "Execution", "Sparse Context Selection enabled")
         
         self.prompt = PromptTemplate(
             input_variables=["context_object", "tool_results"],
@@ -392,23 +370,13 @@ Response format:
         self.chain = self.prompt | self.llm | self.parser
     
     
-    def _hyde_retrieval(self, query: str, context: str, tool_name: str, top_k: int = 3) -> List[ToolResult]:
-        """Perform HyDE-enhanced document retrieval using PostgreSQL/pgvector database."""
+    def _simple_retrieval(self, query: str, context: str, tool_name: str, top_k: int = 3) -> List[ToolResult]:
+        """Simple document retrieval using PostgreSQL/pgvector database."""
         
-        # Step 1: Generate hypothetical document using HyDE
-        hyde_result = self.hyde_generator(
-            query=query,
-            context=context
-        )
-        hypothetical_doc = hyde_result.hypothetical_document
+        # Use direct retrieval with custom reranking
+        documents = self.retriever.invoke(query)
         
-        # Step 2: Use hypothetical document for retrieval (more effective than original query)
-        enhanced_query = f"{hypothetical_doc} {query}"  # Combine for better results
-        
-        # Step 3: Retrieve using PostgreSQL/pgvector with custom reranking
-        documents = self.retriever.invoke(enhanced_query)
-        
-        # Step 4: Convert LangChain documents to ToolResult format
+        # Convert LangChain documents to ToolResult format
         results = []
         for i, doc in enumerate(documents[:top_k]):
             # Ensure source_id is always a string (database id might be int)
@@ -424,7 +392,7 @@ Response format:
             )
             results.append(result)
         
-        log_agent_step(self.logger, "HyDE Retrieval", f"Retrieved {len(results)} documents for {tool_name}")
+        log_agent_step(self.logger, "Simple Retrieval", f"Retrieved {len(results)} documents for {tool_name}")
         return results
     
     
@@ -447,9 +415,54 @@ Response format:
         
         log_agent_step(self.logger, "Direct PGVector Retrieval", f"Retrieved {len(results)} documents for {tool_name}")
         return results
+
+    async def _direct_pgvector_retrieval_async(self, query: str, context: str, tool_name: str, top_k: int = 3) -> List[ToolResult]:
+        """Async direct PostgreSQL/pgvector retrieval without HyDE (high-performance alternative)."""
+        
+        # Use async get_top_k_chunks for concurrent retrieval
+        chunks_with_scores = await get_top_k_chunks_async(query, k=top_k)
+        
+        results = []
+        for i, (content, scores) in enumerate(chunks_with_scores):
+            result = ToolResult(
+                tool_name=tool_name,
+                sub_query=query,
+                content=content,
+                source_id=f"{tool_name}_direct_async_{i}",
+                relevance_score=scores.get("combined_score", 0.8)
+            )
+            results.append(result)
+        
+        log_agent_step(self.logger, "Async Direct PGVector Retrieval", f"Retrieved {len(results)} documents for {tool_name}")
+        return results
+
+    async def _simple_retrieval_async(self, query: str, context: str, tool_name: str, top_k: int = 3) -> List[ToolResult]:
+        """Async simple document retrieval using PostgreSQL/pgvector database."""
+        
+        # Use async retrieval with custom reranking
+        documents = await self.async_retriever.retrieve(query)
+        
+        # Convert LangChain documents to ToolResult format
+        results = []
+        for i, doc in enumerate(documents[:top_k]):
+            # Ensure source_id is always a string (database id might be int)
+            doc_id = doc.metadata.get("id", f"{tool_name}_{i}")
+            source_id = str(doc_id) if doc_id is not None else f"{tool_name}_{i}"
+            
+            result = ToolResult(
+                tool_name=tool_name,
+                sub_query=query,
+                content=doc.page_content,
+                source_id=f"async_{source_id}",
+                relevance_score=doc.metadata.get("combined_score", 0.8)  # From custom reranker
+            )
+            results.append(result)
+        
+        log_agent_step(self.logger, "Async Simple Retrieval", f"Retrieved {len(results)} documents for {tool_name}")
+        return results
     
     def _get_relevant_context_from_short_term_memory(self, user_context: Dict[str, Any], enhanced_query: Dict[str, Any]) -> str:
-        """Build context for HyDE from short_term_memory and enhanced query."""
+        """Build context for retrieval from short_term_memory and enhanced query."""
         context_parts = []
         
         # Add enhanced query context
@@ -643,7 +656,7 @@ Response format:
                     context.execution = result
                     
             else:
-                # Use original HyDE method (legacy mode)
+                # Use simple retrieval method (standard mode)
                 result = self._execute_legacy_synthesis(context, plan, enhanced_query, context.user_context)
                 context.execution = result
             
@@ -656,13 +669,13 @@ Response format:
             return context
     
     def _execute_legacy_synthesis(self, context: ContextObject, plan: List[Dict[str, Any]], enhanced_query: Dict[str, Any], user_context: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute using the original HyDE method for backward compatibility."""
+        """Execute using simple retrieval for backward compatibility."""
         
-        # Execute tools using HyDE for enhanced retrieval
-        tool_results = self._execute_tools_with_hyde(plan, enhanced_query, user_context)
+        # Execute tools using simple retrieval
+        tool_results = self._execute_tools_simple(plan, enhanced_query, user_context)
         
         # Convert tool results to dict format for prompt
-        tool_results_dict = [result.dict() for result in tool_results]
+        tool_results_dict = [result.model_dump() for result in tool_results]
         
         # Invoke the synthesis chain with full context
         result = self.chain.invoke({
@@ -671,3 +684,31 @@ Response format:
         })
         
         return result
+    
+    def _execute_tools_simple(self, plan: List[Dict[str, Any]], enhanced_query: Dict[str, Any], user_context: Dict[str, Any]) -> List[ToolResult]:
+        """Execute tools using simple PostgreSQL retrieval."""
+        all_results = []
+        
+        # Build context from user memory
+        context_string = self._get_relevant_context_from_short_term_memory(user_context, enhanced_query)
+        
+        # Execute each tool in the plan
+        for tool_step in plan:
+            tool_name = tool_step.get("tool", "unknown_tool")
+            sub_queries = tool_step.get("sub_queries", [tool_step.get("query", "")])
+            
+            log_agent_step(self.logger, "Tool Execution", f"Executing {tool_name} with {len(sub_queries)} queries")
+            
+            for query in sub_queries:
+                if query:  # Skip empty queries
+                    # Use simple retrieval
+                    results = self._simple_retrieval(
+                        query=query,
+                        context=context_string,
+                        tool_name=tool_name,
+                        top_k=3
+                    )
+                    all_results.extend(results)
+        
+        log_agent_step(self.logger, "Tool Execution", f"Total results collected: {len(all_results)}")
+        return all_results
