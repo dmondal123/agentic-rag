@@ -19,6 +19,7 @@ from .base_agent import ContextObject, get_llm
 from utils.context_utils import format_context_json
 from utils.memory_utils import get_relevant_memory_context
 from utils.logging_utils import setup_logger, log_agent_step, log_error, log_warning
+from retrieval_utils import get_retriever, get_top_k_chunks, PGVectorRetriever
 
 class ExecutionOutput(BaseModel):
     """Output structure for Execution Agent."""
@@ -33,11 +34,6 @@ class ToolResult(BaseModel):
     source_id: str
     relevance_score: float = Field(default=0.0, description="Similarity score for retrieved content")
 
-class DocumentChunk(BaseModel):
-    """Represents a document chunk for retrieval."""
-    id: str
-    content: str
-    metadata: Dict[str, Any] = Field(default_factory=dict)
     embedding: Optional[List[float]] = None
 
 # DSPy Signature for HyDE - generates hypothetical documents
@@ -343,11 +339,18 @@ class ExecutionAgent(Runnable):
         # Initialize HyDE module
         self.hyde_generator = dspy.ChainOfThought(HyDEGeneration)
         
-        # Initialize mock document store (in production, this would be your vector DB)
-        self.document_store = self._initialize_mock_documents()
+        # Initialize PostgreSQL/pgvector retriever (required)
+        try:
+            self.retriever = get_retriever(k=10)  # Get more results for better HyDE selection
+            log_agent_step(self.logger, "Execution", "Successfully initialized PostgreSQL retriever")
+        except Exception as e:
+            error_msg = f"Failed to initialize PostgreSQL retriever: {e}"
+            log_error(self.logger, "PostgreSQL Setup", e)
+            raise RuntimeError(f"ExecutionAgent requires PostgreSQL connection. {error_msg}") from e
         
         # Initialize Sparse Context Selection components
         self.use_sparse_context = os.getenv("ENABLE_SPARSE_CONTEXT", "true").lower() == "true"
+        self.use_hyde_retrieval = os.getenv("USE_HYDE_RETRIEVAL", "true").lower() == "true"
         self.document_encoder = ParallelDocumentEncoder()
         self.context_selector = SparseContextSelector()
         self.control_token_generator = ControlTokenGenerator()
@@ -388,48 +391,9 @@ Response format:
         self.parser = JsonOutputParser(pydantic_object=ExecutionOutput)
         self.chain = self.prompt | self.llm | self.parser
     
-    def _initialize_mock_documents(self) -> List[DocumentChunk]:
-        """Initialize a mock document store for demonstration."""
-        # In production, this would load from your vector database
-        documents = [
-            DocumentChunk(
-                id="doc_1",
-                content="React is a JavaScript library for building user interfaces. It uses a virtual DOM which provides excellent performance for large applications. React's component-based architecture allows for better code reusability and maintainability. The latest versions include features like Concurrent Mode and Suspense.",
-                metadata={"source": "react_docs", "type": "technical_documentation"}
-            ),
-            DocumentChunk(
-                id="doc_2", 
-                content="Vue.js is a progressive JavaScript framework that is incrementally adoptable. It offers excellent performance through its reactive data system and virtual DOM implementation. Vue provides simpler state management and has a gentler learning curve compared to React. It's particularly good for rapid prototyping.",
-                metadata={"source": "vue_docs", "type": "technical_documentation"}
-            ),
-            DocumentChunk(
-                id="doc_3",
-                content="Performance comparison between React and Vue shows that both frameworks offer excellent performance for most applications. React excels in large, complex applications with its fiber architecture, while Vue.js provides better out-of-the-box performance for smaller to medium applications. Bundle size differences are minimal in modern versions.",
-                metadata={"source": "performance_study", "type": "research_paper"}
-            ),
-            DocumentChunk(
-                id="doc_4",
-                content="Large-scale React applications benefit from features like code splitting, lazy loading, and React.memo for optimization. The ecosystem includes robust tools like Redux for state management and Next.js for server-side rendering. Enterprise adoption is high due to Facebook's backing.",
-                metadata={"source": "enterprise_guide", "type": "best_practices"}
-            ),
-            DocumentChunk(
-                id="doc_5",
-                content="Vue.js in enterprise applications has grown significantly. The Vue 3 Composition API provides better TypeScript support and code organization for large codebases. Nuxt.js serves as the full-stack framework equivalent to Next.js for React.",
-                metadata={"source": "vue_enterprise", "type": "case_study"}
-            )
-        ]
-        return documents
-    
-    def _simple_embedding_similarity(self, text1: str, text2: str) -> float:
-        """Simple similarity based on word overlap - in production use proper embeddings."""
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
-        intersection = len(words1 & words2)
-        union = len(words1 | words2)
-        return intersection / union if union > 0 else 0.0
     
     def _hyde_retrieval(self, query: str, context: str, tool_name: str, top_k: int = 3) -> List[ToolResult]:
-        """Perform HyDE-enhanced document retrieval."""
+        """Perform HyDE-enhanced document retrieval using PostgreSQL/pgvector database."""
         
         # Step 1: Generate hypothetical document using HyDE
         hyde_result = self.hyde_generator(
@@ -438,29 +402,50 @@ Response format:
         )
         hypothetical_doc = hyde_result.hypothetical_document
         
-        # Step 2: Find documents similar to the hypothetical document
-        # In production: embed hypothetical_doc and search vector database
-        similarities = []
-        for doc in self.document_store:
-            similarity = self._simple_embedding_similarity(hypothetical_doc, doc.content)
-            similarities.append((doc, similarity))
+        # Step 2: Use hypothetical document for retrieval (more effective than original query)
+        enhanced_query = f"{hypothetical_doc} {query}"  # Combine for better results
         
-        # Step 3: Sort by similarity and return top-k results
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        top_documents = similarities[:top_k]
+        # Step 3: Retrieve using PostgreSQL/pgvector with custom reranking
+        documents = self.retriever.invoke(enhanced_query)
         
-        # Step 4: Convert to tool results
+        # Step 4: Convert LangChain documents to ToolResult format
         results = []
-        for i, (doc, score) in enumerate(top_documents):
+        for i, doc in enumerate(documents[:top_k]):
+            # Ensure source_id is always a string (database id might be int)
+            doc_id = doc.metadata.get("id", f"{tool_name}_{i}")
+            source_id = str(doc_id) if doc_id is not None else f"{tool_name}_{i}"
+            
             result = ToolResult(
                 tool_name=tool_name,
                 sub_query=query,
-                content=doc.content,
-                source_id=doc.id,
-                relevance_score=score
+                content=doc.page_content,
+                source_id=source_id,
+                relevance_score=doc.metadata.get("combined_score", 0.8)  # From custom reranker
             )
             results.append(result)
         
+        log_agent_step(self.logger, "HyDE Retrieval", f"Retrieved {len(results)} documents for {tool_name}")
+        return results
+    
+    
+    def _direct_pgvector_retrieval(self, query: str, context: str, tool_name: str, top_k: int = 3) -> List[ToolResult]:
+        """Direct PostgreSQL/pgvector retrieval without HyDE (faster alternative)."""
+        
+        # Use get_top_k_chunks directly for faster retrieval
+        chunks_with_scores = get_top_k_chunks(query, k=top_k)
+        
+        results = []
+        for i, (content, scores) in enumerate(chunks_with_scores):
+            result = ToolResult(
+                tool_name=tool_name,
+                sub_query=query,
+                content=content,
+                source_id=f"{tool_name}_direct_{i}",
+                relevance_score=scores.get("combined_score", 0.8)
+            )
+            results.append(result)
+        
+        log_agent_step(self.logger, "Direct PGVector Retrieval", f"Retrieved {len(results)} documents for {tool_name}")
         return results
     
     def _get_relevant_context_from_short_term_memory(self, user_context: Dict[str, Any], enhanced_query: Dict[str, Any]) -> str:
@@ -495,9 +480,15 @@ Response format:
             tool_name = step.get("tool", f"knowledge_base_{i+1}")
             sub_query = step.get("sub_query", enhanced_query.get("rewritten_query", "default query"))
             
-            # Use HyDE for retrieval
-            hyde_results = self._hyde_retrieval(sub_query, context, tool_name)
-            all_results.extend(hyde_results)
+            # Choose retrieval method based on configuration
+            if self.use_hyde_retrieval:
+                # Use HyDE-enhanced retrieval for better semantic understanding
+                results = self._hyde_retrieval(sub_query, context, tool_name)
+            else:
+                # Use direct PostgreSQL retrieval for faster response
+                results = self._direct_pgvector_retrieval(sub_query, context, tool_name)
+            
+            all_results.extend(results)
         
         return all_results
     
