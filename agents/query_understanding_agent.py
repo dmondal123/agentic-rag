@@ -9,7 +9,9 @@ from langchain_core.runnables import Runnable
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 
-# No longer using LlamaIndex HyDE - using unified LLM approach
+# LlamaIndex HyDE integration for enhanced query rewriting
+from llama_index.core.indices.query.query_transform import HyDEQueryTransform
+from llama_index.core.base.base_query_engine import BaseQueryEngine
 
 # Add utils to path
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -34,11 +36,12 @@ class QueryUnderstandingOutput(BaseModel):
     enhanced_query: Optional[Dict[str, Any]] = Field(default=None, description="Enhanced query information")
 
 class EnhancedQuery(BaseModel):
-    """Enhanced query structure."""
+    """Enhanced query structure with HyDE support."""
     original_query: str
     rewritten_query: str
     query_variations: List[str]
     expansion_terms: List[str]
+    hypothetical_document: Optional[str] = Field(default=None, description="HyDE generated hypothetical document")
 
 # Single comprehensive system prompt for query understanding
 UNIFIED_QUERY_UNDERSTANDING_PROMPT = """
@@ -48,6 +51,9 @@ Context (JSON format):
 {context_json}
 
 User Query: {user_query}
+
+HyDE Hypothetical Document (if generated):
+{hyde_document}
 
 Analyze the query and provide a complete understanding including:
 
@@ -70,6 +76,7 @@ Analyze the query and provide a complete understanding including:
    - Creating 2-3 alternative phrasings
    - Identifying key expansion terms and related concepts
    - Using conversation context to resolve pronouns and references
+   - Using the provided HyDE hypothetical document (if available) for better context
 
 IMPORTANT: Use the full context to understand follow-up queries and conversation flow.
 
@@ -84,7 +91,8 @@ Respond with ONLY valid JSON:
         "original_query": "the original user query",
         "rewritten_query": "clearer, more direct version",
         "query_variations": ["variation1", "variation2", "variation3"],
-        "expansion_terms": ["term1", "term2", "term3"]
+        "expansion_terms": ["term1", "term2", "term3"],
+        "hypothetical_document": "HyDE generated hypothetical document or null"
     }} or null
 }}
 """
@@ -97,6 +105,16 @@ class QueryUnderstandingAgent(Runnable):
         self.logger = setup_logger("query_understanding_agent")
         self.llm = get_llm()
         
+        # Initialize HyDE query transformer for enhanced query rewriting
+        try:
+            self.hyde_transform = HyDEQueryTransform(include_original=True)
+            self.use_hyde = True
+            log_agent_step(self.logger, "QueryUnderstanding", "HyDE transformer initialized successfully")
+        except Exception as e:
+            self.hyde_transform = None
+            self.use_hyde = False
+            log_agent_step(self.logger, "QueryUnderstanding", f"HyDE initialization failed, proceeding without HyDE: {e}")
+        
         # Initialize single unified chain for all query understanding tasks
         self.unified_chain = self._create_unified_chain()
         
@@ -104,16 +122,42 @@ class QueryUnderstandingAgent(Runnable):
         self.max_recent_turns = 6  # Keep last 6 turns in recent_turns
         self.max_summary_words = 150  # Summary word limit
         
-        log_agent_step(self.logger, "QueryUnderstanding", "Initialized unified query understanding agent")
+        log_agent_step(self.logger, "QueryUnderstanding", "Initialized unified query understanding agent with HyDE support")
     
     def _create_unified_chain(self):
         """Create single LangChain chain for all query understanding tasks."""
         unified_prompt = PromptTemplate(
-            input_variables=["context_json", "user_query"],
+            input_variables=["context_json", "user_query", "hyde_document"],
             template=UNIFIED_QUERY_UNDERSTANDING_PROMPT
         )
         unified_parser = JsonOutputParser()
         return unified_prompt | self.llm | unified_parser
+    
+    def _generate_hypothetical_document(self, query: str) -> Optional[str]:
+        """Generate hypothetical document using HyDE for better query rewriting."""
+        if not self.use_hyde or not self.hyde_transform:
+            return None
+            
+        try:
+            # Create a simple query bundle for HyDE
+            from llama_index.core.base.base_query_engine import QueryBundle
+            query_bundle = QueryBundle(query_str=query)
+            
+            # Generate HyDE hypothetical document
+            hyde_query_bundle = self.hyde_transform(query_bundle)
+            
+            # Extract the hypothetical document from embedding strings
+            if hasattr(hyde_query_bundle, 'embedding_strs') and hyde_query_bundle.embedding_strs:
+                hypothetical_doc = hyde_query_bundle.embedding_strs[0]
+                log_agent_step(self.logger, "HyDE", f"Generated hypothetical document for query: '{query[:50]}...'")
+                return hypothetical_doc
+            
+            log_agent_step(self.logger, "HyDE", "No hypothetical document generated")
+            return None
+            
+        except Exception as e:
+            log_agent_step(self.logger, "HyDE", f"Failed to generate hypothetical document: {e}")
+            return None
     
     def _detect_topic_change(self, query: str, intent: str, short_term_memory: Dict[str, Any]) -> Dict[str, Any]:
         """Simplified topic change detection without DSPy."""
@@ -227,10 +271,14 @@ class QueryUnderstandingAgent(Runnable):
             # Prepare full context JSON for the unified LLM call
             full_context_json = format_context_json(context)
             
-            # Single LLM call for all query understanding tasks
+            # Generate HyDE hypothetical document for enhanced query rewriting
+            hyde_document = self._generate_hypothetical_document(user_query)
+            
+            # Single LLM call for all query understanding tasks with HyDE context
             unified_result = self.unified_chain.invoke({
                 "context_json": full_context_json,
-                "user_query": user_query
+                "user_query": user_query,
+                "hyde_document": hyde_document or "No hypothetical document generated"
             })
             
             # Step 2: Detect topic changes using simplified method
@@ -248,13 +296,21 @@ class QueryUnderstandingAgent(Runnable):
             )
             
             # Construct the final result using unified response
+            enhanced_query = unified_result.get("enhanced_query")
+            
+            # Ensure HyDE hypothetical document is included in enhanced query
+            if enhanced_query and hyde_document:
+                enhanced_query["hypothetical_document"] = hyde_document
+            elif enhanced_query and not enhanced_query.get("hypothetical_document"):
+                enhanced_query["hypothetical_document"] = None
+                
             result = {
                 "intent": unified_result["intent"],
                 "confidence": float(unified_result["confidence"]),
                 "is_ambiguous": unified_result["is_ambiguous"],
                 "ambiguity_reason": unified_result.get("ambiguity_reason") if unified_result["is_ambiguous"] else None,
                 "clarification_question": unified_result.get("clarification_question") if unified_result["is_ambiguous"] else None,
-                "enhanced_query": unified_result.get("enhanced_query"),  # Already structured by LLM
+                "enhanced_query": enhanced_query,
                 "topic_change_detected": topic_change["changed"],
                 "current_topic": short_term_memory["current_topic"]
             }
@@ -264,7 +320,8 @@ class QueryUnderstandingAgent(Runnable):
             context.current_stage = "query_understanding_complete"
             
             has_enhancement = result["enhanced_query"] is not None
-            log_agent_step(self.logger, "QueryUnderstanding", f"Completed unified processing - Intent: {result['intent']}, Enhanced: {has_enhancement}")
+            hyde_status = "with HyDE" if hyde_document else "without HyDE"
+            log_agent_step(self.logger, "QueryUnderstanding", f"Completed unified processing - Intent: {result['intent']}, Enhanced: {has_enhancement}, {hyde_status}")
             return context
             
         except Exception as e:
