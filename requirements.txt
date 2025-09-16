@@ -2,6 +2,8 @@ langchain
 langchain-community
 langchain-core
 langchain-litellm
+langchain-openai
+langchain-anthropic
 python-dotenv
 pydantic
 llama-index
@@ -10,3 +12,5 @@ openai
 asyncpg
 aiohttp
 psycopg2-binary
+scikit-learn
+numpy
