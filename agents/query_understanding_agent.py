@@ -52,11 +52,11 @@ User Query: {user_query}
 Analyze the query and provide a complete understanding including:
 
 1. INTENT CLASSIFICATION - Classify into one of:
-   - abcd_1: Factual information requests
-   - abcd_2: Analytical or comparison requests  
-   - abcd_3: Procedural or how-to questions
-   - abcd_4: Opinion or recommendation requests
-   - abcd_5: Complex multi-step queries
+   - information_retrieval: Factual information and knowledge base queries
+   - analysis_comparison: Data analysis, calculations and comparisons
+   - procedural_guidance: Step-by-step instructions and how-to guides
+   - recommendation: Opinions, suggestions and recommendations
+   - complex_query: Multi-step queries requiring multiple tools/steps
    - UNKNOWN: Unclear or unclassifiable queries
 
 2. AMBIGUITY DETECTION - Check if the query needs clarification by examining:
@@ -129,11 +129,13 @@ class QueryUnderstandingAgent(Runnable):
         
         # Basic keyword-based topic change detection
         topic_keywords = {
-            "abcd_1": ["facts", "information", "what", "define", "explain"],
-            "abcd_2": ["compare", "analyze", "difference", "vs", "versus"],
-            "abcd_3": ["how", "steps", "procedure", "guide", "tutorial"],
-            "abcd_4": ["recommend", "suggest", "opinion", "best", "choose"],
-            "abcd_5": ["complex", "multi-step", "comprehensive", "detailed"]
+            "specific_fact_retrieval": ["what", "who", "when", "where", "why", "define", "explain", "tell me about"],
+            "document_summary": ["summarize", "overview", "brief", "main points", "key points", "synopsis"],
+            "comparative_analysis": ["compare", "contrast", "difference", "similarities", "versus", "vs"],
+            "procedural_inquiry": ["how to", "steps", "procedure", "guide", "tutorial", "instructions"],
+            "general_inquiry": ["tell me more", "elaborate", "details", "explain further", "background"],
+            "chitchat": ["hello", "hi", "how are you", "thanks", "bye", "nice", "good"],
+            "unknown": ["unclear", "confused", "not sure", "what do you mean", "clarify"]
         }
         
         query_lower = query.lower()
