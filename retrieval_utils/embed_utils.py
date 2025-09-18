@@ -22,7 +22,7 @@ def get_db_connection():
     return psycopg2.connect(
         host=os.getenv("PGHOST", "localhost"),
         port=os.getenv("PGPORT", 5433),
-        user=os.getenv("PGUSER", "postgres"),
+        user=os.getenv("PGUSER", "postgres"), 
         password=os.getenv("PGPASSWORD", "password"),
         dbname=os.getenv("PGDATABASE", "pdfrag")
     )

@@ -15,6 +15,13 @@ import aiohttp
 
 load_dotenv()
 
+def generate_embeddings(chunks: List[str]) -> List[List[float]]:
+    response = client.embeddings.create(
+        input=chunks,
+        model="text-embedding-3-small"
+    )
+    return [item.embedding for item in response.data]
+
 class AsyncCustomReranker:
     """An async custom reranker that combines multiple similarity metrics with concurrent processing."""
     

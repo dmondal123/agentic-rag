@@ -14,3 +14,5 @@ aiohttp
 psycopg2-binary
 scikit-learn
 numpy
+cassandra-driver
+geomet
